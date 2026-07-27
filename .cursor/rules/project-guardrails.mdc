@@ -1,0 +1,20 @@
+---
+description: Leitplanken fuer das Forschungs-MAS
+alwaysApply: true
+---
+
+# Strict TDD
+- Kein Produktionscode ohne vorher existierenden, scheiternden Test (Red-Green-Refactor).
+- Tests liegen in tests/, nutzen pytest + pytest-asyncio (asyncio_mode = "auto").
+
+# Architecture First
+- Ausschliesslich Microsoft Agent Framework 1.0 (stabile API): `Agent`, `agent_framework.orchestrations.MagenticBuilder`.
+- Verboten: Semantic-Kernel-Syntax (sk.Kernel, KernelFunction), altes AutoGen (autogen.AssistantAgent, GroupChat), RC-APIs (fluent `.participants().with_standard_manager()`).
+- Gemini ausschliesslich ueber `agent_framework_gemini.GeminiChatClient`.
+
+# Async Native
+- Alle Agenten-Aufrufe, Workflow-Runs und CLI-Loops sind async (asyncio); kein blockierendes I/O im Event-Loop (input() nur via asyncio.to_thread).
+
+# Error Handling
+- Jeder Gemini-Aufruf laeuft durch eine Resilienz-Middleware (try/except um call_next) mit Retry + exponentiellem Backoff fuer Rate Limits und definiertem Fallback bei Content-Filter-Fehlern.
+- Keine nackten API-Aufrufe ohne Middleware-Absicherung.
