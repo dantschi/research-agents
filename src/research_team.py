@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from agent_framework import (
     Agent,
@@ -18,7 +19,7 @@ from agent_framework import (
     agent_middleware,
 )
 from agent_framework.orchestrations import MagenticBuilder
-from google.genai.errors import ClientError
+from google.genai.errors import APIError, ClientError, ServerError
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ MAX_RESET_COUNT = 2
 
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 0.5
+TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 CONTENT_FILTER_FALLBACK = (
     "Die Gemini-Antwort wurde durch den Content-Filter blockiert. "
@@ -35,6 +37,16 @@ CONTENT_FILTER_FALLBACK = (
 )
 
 SUGGESTED_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview")
+
+AUTH_ERROR_MESSAGE = (
+    "Gemini-Authentifizierung fehlgeschlagen (ungueltiger oder fehlender API-Key).\n"
+    "Bitte pruefe GEMINI_API_KEY bzw. GOOGLE_API_KEY in der .env."
+)
+
+TRANSIENT_ERROR_MESSAGE = (
+    "Gemini ist voruebergehend nicht erreichbar oder das Rate-/Quota-Limit ist erschoepft.\n"
+    "Bitte warte kurz und versuche es erneut; bei dauerhaften 429 ggf. Quota/Billing pruefen."
+)
 
 VISIONARY_INSTRUCTIONS = """\
 Du bist der Visionaer in einem wissenschaftlichen Forschungs-Debattier-Team.
@@ -58,8 +70,20 @@ ausgewogene wissenschaftliche Bilanz vorliegt. Antworte auf Deutsch.
 """
 
 
-class ModelUnavailableError(RuntimeError):
+class ResearchTeamError(RuntimeError):
+    """Nutzerbezogene Fehler des Forschungs-Teams (CLI soll nicht crashen)."""
+
+
+class ModelUnavailableError(ResearchTeamError):
     """Das konfigurierte Gemini-Modell ist fuer diesen API-Key nicht nutzbar."""
+
+
+class GeminiAuthError(ResearchTeamError):
+    """API-Key fehlt, ist ungueltig oder hat keine Berechtigung."""
+
+
+class GeminiTransientError(ResearchTeamError):
+    """Rate-Limit oder Serverfehler trotz Retries."""
 
 
 def extract_model_name_from_error(exc: BaseException) -> str | None:
@@ -81,6 +105,42 @@ def is_model_unavailable_error(exc: BaseException) -> bool:
     return False
 
 
+def is_auth_error(exc: BaseException) -> bool:
+    """Erkennt Authentifizierungs- und Berechtigungsfehler."""
+    if isinstance(exc, ClientError) and exc.code in {401, 403}:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "api key not valid",
+            "invalid api key",
+            "unauthenticated",
+            "permission_denied",
+            "permission denied",
+        )
+    )
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Erkennt retrybare Fehler (Rate-Limit, Server-Ueberlastung, Timeouts)."""
+    if isinstance(exc, APIError) and getattr(exc, "code", None) in TRANSIENT_STATUS_CODES:
+        return True
+    if isinstance(exc, ServerError):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "resource exhausted",
+            "rate limit",
+            "unavailable",
+            "timeout",
+            "temporarily",
+        )
+    )
+
+
 def format_model_unavailable_message(
     model: str | None = None,
     *,
@@ -97,11 +157,20 @@ def format_model_unavailable_message(
     )
 
 
-def _is_rate_limit_error(exc: BaseException) -> bool:
-    if isinstance(exc, ClientError) and exc.code == 429:
-        return True
-    message = str(exc).lower()
-    return "429" in message or "resource exhausted" in message or "rate limit" in message
+def is_workflow_failure_event(event: Any) -> bool:
+    """True, wenn Magentic einen fehlgeschlagenen Workflow-Schritt meldet."""
+    event_type = getattr(event, "type", None)
+    return event_type in {"failed", "executor_failed"}
+
+
+def format_workflow_failure_message(event: Any) -> str:
+    """Formatiert eine lesbare Meldung aus einem Workflow-Fehler-Event."""
+    data = getattr(event, "data", None)
+    executor_id = getattr(data, "executor_id", None) or getattr(event, "executor_id", None)
+    error_type = getattr(data, "error_type", None) or "Fehler"
+    message = getattr(data, "message", None) or str(data or event)
+    where = f" bei '{executor_id}'" if executor_id else ""
+    return f"Workflow-Fehler{where} ({error_type}): {message}"
 
 
 def _is_content_filter_error(exc: BaseException) -> bool:
@@ -119,17 +188,22 @@ async def gemini_resilience_middleware(
     context: AgentContext,
     call_next: Callable[[], Awaitable[None]],
 ) -> None:
-    """Absichert Gemini-Aufrufe mit Retry, Content-Filter- und Modell-Fehlerbehandlung."""
+    """Absichert Gemini-Aufrufe mit Retry und klaren Nutzerfehlern."""
     last_error: BaseException | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             await call_next()
             return
-        except ModelUnavailableError:
+        except ResearchTeamError:
             raise
         except Exception as exc:  # noqa: BLE001 - Middleware faengt API-Fehler zentral
             last_error = exc
+
+            if is_auth_error(exc):
+                logger.error("Gemini-Auth-Fehler: %s", exc)
+                raise GeminiAuthError(AUTH_ERROR_MESSAGE) from exc
+
             if is_model_unavailable_error(exc):
                 message = format_model_unavailable_message(exc=exc)
                 logger.error("Gemini-Modell nicht verfuegbar: %s", message)
@@ -151,10 +225,10 @@ async def gemini_resilience_middleware(
                 )
                 return
 
-            if _is_rate_limit_error(exc) and attempt < MAX_RETRIES:
+            if is_transient_error(exc) and attempt < MAX_RETRIES:
                 delay = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
-                    "Rate-Limit (Versuch %s/%s), Backoff %.1fs: %s",
+                    "Transienter Gemini-Fehler (Versuch %s/%s), Backoff %.1fs: %s",
                     attempt,
                     MAX_RETRIES,
                     delay,
@@ -163,9 +237,15 @@ async def gemini_resilience_middleware(
                 await asyncio.sleep(delay)
                 continue
 
+            if is_transient_error(exc):
+                logger.error("Gemini transient erschoepft: %s", exc)
+                raise GeminiTransientError(TRANSIENT_ERROR_MESSAGE) from exc
+
             raise
 
     if last_error is not None:
+        if is_transient_error(last_error):
+            raise GeminiTransientError(TRANSIENT_ERROR_MESSAGE) from last_error
         raise last_error
 
 

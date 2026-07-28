@@ -10,14 +10,17 @@ from typing import Any
 from agent_framework import AgentResponseUpdate
 from agent_framework_gemini import GeminiChatClient
 from dotenv import load_dotenv
-from google.genai.errors import ClientError
+from google.genai.errors import APIError
 
 from src.research_team import (
     ModelUnavailableError,
     ResearchTeam,
+    ResearchTeamError,
     build_research_team,
     format_model_unavailable_message,
+    format_workflow_failure_message,
     is_model_unavailable_error,
+    is_workflow_failure_event,
 )
 
 
@@ -38,25 +41,38 @@ def _configured_model_name() -> str:
     return os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-3.6-flash"
 
 
-def _print_model_unavailable(exc: BaseException) -> None:
-    if isinstance(exc, ModelUnavailableError):
-        print(f"\nFehler: {exc}", file=sys.stderr)
-        return
-    message = format_model_unavailable_message(_configured_model_name(), exc=exc)
+def _print_error(message: str) -> None:
     print(f"\nFehler: {message}", file=sys.stderr)
+
+
+def _print_research_error(exc: BaseException) -> None:
+    if isinstance(exc, ModelUnavailableError):
+        _print_error(str(exc))
+        return
+    if isinstance(exc, ResearchTeamError):
+        _print_error(str(exc))
+        return
+    if is_model_unavailable_error(exc):
+        _print_error(format_model_unavailable_message(_configured_model_name(), exc=exc))
+        return
+    _print_error(str(exc))
 
 
 async def stream_workflow(workflow: Any, prompt: str) -> bool:
     """Streamt Magentic-Events live auf die Konsole.
 
     Returns:
-        True bei erfolgreichem Durchlauf, False bei abgefangenem Modellfehler.
+        True bei erfolgreichem Durchlauf, False bei abgefangenem Fehler.
     """
     last_message_id: str | None = None
     last_label: str | None = None
 
     try:
         async for event in workflow.run(prompt, stream=True):
+            if is_workflow_failure_event(event):
+                _print_error(format_workflow_failure_message(event))
+                return False
+
             if event.type not in ("intermediate", "output"):
                 continue
             if not isinstance(event.data, AgentResponseUpdate):
@@ -84,14 +100,18 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
 
         print("\n")
         return True
-    except ModelUnavailableError as exc:
-        _print_model_unavailable(exc)
+    except ResearchTeamError as exc:
+        _print_research_error(exc)
         return False
-    except ClientError as exc:
-        if is_model_unavailable_error(exc):
-            _print_model_unavailable(exc)
-            return False
-        raise
+    except APIError as exc:
+        _print_research_error(exc)
+        return False
+    except (TimeoutError, OSError, ConnectionError) as exc:
+        _print_error(
+            "Netzwerk- oder Timeout-Fehler bei der Gemini-Anfrage. "
+            f"Details: {exc}"
+        )
+        return False
 
 
 async def read_input(prompt: str) -> str:
@@ -118,7 +138,7 @@ async def run_cli() -> None:
     ok = await stream_workflow(team.workflow, topic)
     if not ok:
         print(
-            "Diskussion abgebrochen. Bitte Modell in der .env korrigieren und erneut starten."
+            "Diskussion abgebrochen. Bitte Konfiguration (.env) pruefen oder spaeter erneut starten."
         )
         return
 
@@ -146,8 +166,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nAbgebrochen.")
         sys.exit(130)
-    except ModelUnavailableError as exc:
-        _print_model_unavailable(exc)
+    except ResearchTeamError as exc:
+        _print_research_error(exc)
         sys.exit(1)
     except RuntimeError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)

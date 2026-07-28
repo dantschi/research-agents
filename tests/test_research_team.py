@@ -8,13 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agent_framework import Agent, AgentContext, AgentResponse, Content, Message, Workflow
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 
 from src.research_team import (
     CONTENT_FILTER_FALLBACK,
     MAX_RESET_COUNT,
     MAX_ROUND_COUNT,
     MAX_STALL_COUNT,
+    GeminiAuthError,
+    GeminiTransientError,
     ModelUnavailableError,
     ResearchTeam,
     build_research_team,
@@ -22,8 +24,12 @@ from src.research_team import (
     create_skeptic,
     create_visionary,
     format_model_unavailable_message,
+    format_workflow_failure_message,
     gemini_resilience_middleware,
+    is_auth_error,
     is_model_unavailable_error,
+    is_transient_error,
+    is_workflow_failure_event,
 )
 from tests.conftest import FakeChatClient
 
@@ -218,3 +224,93 @@ class TestModelUnavailableHandling:
 
         assert "gemini-2.5-flash" in str(raised.value)
         assert "GEMINI_MODEL" in str(raised.value)
+
+
+def _agent_context(name: str = "Manager") -> AgentContext:
+    agent = MagicMock()
+    agent.name = name
+    return AgentContext(
+        agent=agent,
+        messages=[Message(role="user", contents=[Content.from_text("Thema")])],
+    )
+
+
+class TestAuthAndTransientErrors:
+    def test_detects_auth_errors(self) -> None:
+        assert is_auth_error(ClientError(401, {"error": {"message": "API key invalid"}}))
+        assert is_auth_error(ClientError(403, {"error": {"message": "PERMISSION_DENIED"}}))
+        assert not is_auth_error(ClientError(429, {"error": {"message": "Resource exhausted"}}))
+
+    def test_detects_transient_server_errors(self) -> None:
+        assert is_transient_error(ServerError(503, {"error": {"message": "UNAVAILABLE"}}))
+        assert is_transient_error(ServerError(500, {"error": {"message": "INTERNAL"}}))
+        assert is_transient_error(ClientError(429, {"error": {"message": "Resource exhausted"}}))
+        assert not is_transient_error(ClientError(401, {"error": {"message": "bad key"}}))
+
+    @pytest.mark.asyncio
+    async def test_middleware_raises_auth_error(self) -> None:
+        async def unauthorized() -> None:
+            raise ClientError(401, {"error": {"message": "API key not valid", "code": 401}})
+
+        with pytest.raises(GeminiAuthError) as raised:
+            await gemini_resilience_middleware(_agent_context(), unauthorized)
+
+        assert "API-Key" in str(raised.value) or "GEMINI_API_KEY" in str(raised.value)
+
+    @pytest.mark.asyncio
+    async def test_middleware_retries_server_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        attempts = {"count": 0}
+
+        async def flaky() -> None:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise ServerError(503, {"error": {"message": "UNAVAILABLE", "code": 503}})
+
+        await gemini_resilience_middleware(_agent_context(), flaky)
+        assert attempts["count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_middleware_raises_transient_after_retries_exhausted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        async def always_busy() -> None:
+            raise ClientError(429, {"error": {"message": "Resource exhausted", "code": 429}})
+
+        with pytest.raises(GeminiTransientError) as raised:
+            await gemini_resilience_middleware(_agent_context(), always_busy)
+
+        assert "Rate" in str(raised.value) or "spaeter" in str(raised.value).lower() or "später" in str(raised.value).lower() or "Quota" in str(raised.value) or "Limit" in str(raised.value)
+
+
+class TestWorkflowFailureEvents:
+    def test_detects_failed_event_types(self) -> None:
+        failed = MagicMock()
+        failed.type = "failed"
+        failed.data = None
+        executor_failed = MagicMock()
+        executor_failed.type = "executor_failed"
+        executor_failed.data = MagicMock(error_type="ClientError", message="boom", executor_id="Skeptiker")
+        ok = MagicMock()
+        ok.type = "output"
+        ok.data = None
+
+        assert is_workflow_failure_event(failed) is True
+        assert is_workflow_failure_event(executor_failed) is True
+        assert is_workflow_failure_event(ok) is False
+
+    def test_formats_workflow_failure_message(self) -> None:
+        event = MagicMock()
+        event.type = "executor_failed"
+        event.data = MagicMock(
+            error_type="AttributeError",
+            message="something broke",
+            executor_id="Visionaer",
+        )
+        text = format_workflow_failure_message(event)
+        assert "Visionaer" in text
+        assert "something broke" in text
