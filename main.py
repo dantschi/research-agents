@@ -16,6 +16,7 @@ from src.research_team import (
     ModelUnavailableError,
     ResearchTeam,
     ResearchTeamError,
+    build_follow_up_task,
     build_research_team,
     format_model_unavailable_message,
     format_workflow_failure_message,
@@ -59,14 +60,20 @@ def _print_research_error(exc: BaseException) -> None:
     _print_error(str(exc))
 
 
-async def stream_workflow(workflow: Any, prompt: str) -> bool:
+def _is_completed_workflow_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "already been completed" in message or "no further messages can be processed" in message
+
+
+async def stream_workflow(workflow: Any, prompt: str) -> tuple[bool, str]:
     """Streamt Magentic-Events live auf die Konsole.
 
     Returns:
-        True bei erfolgreichem Durchlauf, False bei abgefangenem Fehler.
+        (True, gesammelter Output-Text) bei Erfolg, sonst (False, bisheriger Text).
     """
     last_message_id: str | None = None
     last_label: str | None = None
+    collected: list[str] = []
     thinking = ThinkingIndicator(label="Nachdenken")
 
     try:
@@ -75,7 +82,7 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
             if is_workflow_failure_event(event):
                 await thinking.stop()
                 _print_error(format_workflow_failure_message(event))
-                return False
+                return False, "".join(collected)
 
             if event.type not in ("intermediate", "output"):
                 await thinking.start()
@@ -107,21 +114,31 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
                 last_label = label
 
             print(text, end="", flush=True)
+            collected.append(text)
 
         print("\n")
-        return True
+        return True, "".join(collected)
     except ResearchTeamError as exc:
         _print_research_error(exc)
-        return False
+        return False, "".join(collected)
     except APIError as exc:
         _print_research_error(exc)
-        return False
+        return False, "".join(collected)
+    except RuntimeError as exc:
+        if _is_completed_workflow_error(exc):
+            _print_error(
+                "Der vorherige Magentic-Lauf ist abgeschlossen. "
+                "Fuer Folgefragen wird automatisch ein neuer Workflow gestartet – "
+                "bitte den Prompt erneut eingeben."
+            )
+            return False, "".join(collected)
+        raise
     except (TimeoutError, OSError, ConnectionError) as exc:
         _print_error(
             "Netzwerk- oder Timeout-Fehler bei der Gemini-Anfrage. "
             f"Details: {exc}"
         )
-        return False
+        return False, "".join(collected)
     finally:
         await thinking.stop()
 
@@ -132,7 +149,7 @@ async def read_input(prompt: str) -> str:
 
 
 async def run_cli() -> None:
-    """Phase 1: autonome Diskussion; Phase 2: interaktiver Human-in-the-Loop."""
+    """Phase 1: autonome Diskussion; Phase 2: neue Magentic-Instanz pro Prompt."""
     print("=" * 60)
     print(" Forschungs-Debattier-Team (Magentic + Gemini)")
     print(" Visionaer | Skeptiker | Manager")
@@ -147,15 +164,18 @@ async def run_cli() -> None:
     team: ResearchTeam = build_research_team(client)
 
     print("\n--- Phase 1: Autonome Diskussion ---\n")
-    ok = await stream_workflow(team.workflow, topic)
+    ok, phase1_text = await stream_workflow(team.workflow, topic)
     if not ok:
         print(
             "Diskussion abgebrochen. Bitte Konfiguration (.env) pruefen oder spaeter erneut starten."
         )
         return
 
+    prior_summary = phase1_text.strip()
+
     print("--- Phase 2: Interaktiver Loop ---")
     print("Gib weitere Anweisungen ein (z.B. 'Skeptiker, gehe tiefer auf Punkt B ein').")
+    print("Jeder Prompt startet einen neuen Magentic-Lauf mit bisherigem Kontext.")
     print("Beenden mit 'exit' oder 'quit'.\n")
 
     while True:
@@ -167,9 +187,22 @@ async def run_cli() -> None:
             break
 
         print("\n--- Weitere Magentic-Runde ---\n")
-        ok = await stream_workflow(team.workflow, user_input)
+        # Magentic-Instanzen sind nach Abschluss terminiert – daher neu bauen.
+        follow_up_team = build_research_team(client)
+        follow_up_task = build_follow_up_task(
+            original_topic=topic,
+            prior_summary=prior_summary,
+            user_prompt=user_input,
+        )
+        ok, round_text = await stream_workflow(follow_up_team.workflow, follow_up_task)
         if not ok:
             print("Runde abgebrochen. Du kannst es mit einem anderen Prompt erneut versuchen.")
+            continue
+
+        if round_text.strip():
+            prior_summary = (
+                f"{prior_summary}\n\nNutzer: {user_input}\n\nTeam:\n{round_text.strip()}"
+            ).strip()
 
 
 def main() -> None:

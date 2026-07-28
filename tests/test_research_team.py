@@ -314,3 +314,18 @@ class TestWorkflowFailureEvents:
         text = format_workflow_failure_message(event)
         assert "Visionaer" in text
         assert "something broke" in text
+
+
+class TestFollowUpTask:
+    def test_build_follow_up_task_includes_topic_history_and_prompt(self) -> None:
+        from src.research_team import build_follow_up_task
+
+        task = build_follow_up_task(
+            original_topic="RISC-V fuer Physical AI",
+            prior_summary="Visionaer und Skeptiker einigten sich auf X.",
+            user_prompt="Welche Foerderprojekte eignen sich?",
+        )
+        assert "RISC-V fuer Physical AI" in task
+        assert "Visionaer und Skeptiker einigten sich auf X." in task
+        assert "Welche Foerderprojekte eignen sich?" in task
+        assert "Fortsetzung" in task or "fortsetzen" in task.lower() or "Neue Anweisung" in task

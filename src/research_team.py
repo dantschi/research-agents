@@ -324,3 +324,25 @@ def build_research_team(client: object) -> ResearchTeam:
 def build_research_workflow(client: object) -> Workflow:
     """Kompatibilitaets-Wrapper: liefert nur den Magentic-Workflow."""
     return build_research_team(client).workflow
+
+
+def build_follow_up_task(
+    *,
+    original_topic: str,
+    prior_summary: str,
+    user_prompt: str,
+) -> str:
+    """Baut eine neue Magentic-Aufgabe mit bisherigem Diskussionskontext.
+
+    Magentic-Workflows sind nach Abschluss terminiert und koennen nicht
+    wiederverwendet werden. Folgeprompts brauchen daher eine neue Instanz
+    plus explizit mitgegebenen Kontext.
+    """
+    summary = prior_summary.strip() or "(noch keine Bilanz)"
+    return (
+        "Fortsetzung der Forschungsdiskussion.\n\n"
+        f"Urspruengliches Thema: {original_topic.strip()}\n\n"
+        f"Bisherige Bilanz:\n{summary}\n\n"
+        f"Neue Anweisung des Nutzers:\n{user_prompt.strip()}\n\n"
+        "Beruecksichtige die bisherige Bilanz und gehe gezielt auf die neue Anweisung ein."
+    )
