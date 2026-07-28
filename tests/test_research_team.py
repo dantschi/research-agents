@@ -15,12 +15,15 @@ from src.research_team import (
     MAX_RESET_COUNT,
     MAX_ROUND_COUNT,
     MAX_STALL_COUNT,
+    ModelUnavailableError,
     ResearchTeam,
     build_research_team,
     create_manager,
     create_skeptic,
     create_visionary,
+    format_model_unavailable_message,
     gemini_resilience_middleware,
+    is_model_unavailable_error,
 )
 from tests.conftest import FakeChatClient
 
@@ -161,3 +164,57 @@ class TestResilienceMiddleware:
         assert context.result is not None
         assert isinstance(context.result, AgentResponse)
         assert CONTENT_FILTER_FALLBACK in (context.result.text or "")
+
+
+class TestModelUnavailableHandling:
+    def test_detects_model_unavailable_404(self) -> None:
+        exc = ClientError(
+            404,
+            {
+                "error": {
+                    "code": 404,
+                    "message": (
+                        "This model models/gemini-2.5-pro is no longer available "
+                        "to new users. Please update your code to use a newer model."
+                    ),
+                    "status": "NOT_FOUND",
+                }
+            },
+        )
+        assert is_model_unavailable_error(exc) is True
+
+    def test_format_message_mentions_model_and_env_hint(self) -> None:
+        message = format_model_unavailable_message("gemini-2.5-pro")
+        assert "gemini-2.5-pro" in message
+        assert "GEMINI_MODEL" in message
+        assert "gemini-3.6-flash" in message or "gemini-3.1-pro-preview" in message
+
+    @pytest.mark.asyncio
+    async def test_middleware_raises_friendly_model_unavailable_error(self) -> None:
+        async def unavailable_next() -> None:
+            raise ClientError(
+                404,
+                {
+                    "error": {
+                        "code": 404,
+                        "message": (
+                            "This model models/gemini-2.5-flash is no longer available "
+                            "to new users."
+                        ),
+                        "status": "NOT_FOUND",
+                    }
+                },
+            )
+
+        agent = MagicMock()
+        agent.name = "Manager"
+        context = AgentContext(
+            agent=agent,
+            messages=[Message(role="user", contents=[Content.from_text("Thema")])],
+        )
+
+        with pytest.raises(ModelUnavailableError) as raised:
+            await gemini_resilience_middleware(context, unavailable_next)
+
+        assert "gemini-2.5-flash" in str(raised.value)
+        assert "GEMINI_MODEL" in str(raised.value)

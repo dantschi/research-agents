@@ -10,15 +10,22 @@ from typing import Any
 from agent_framework import AgentResponseUpdate
 from agent_framework_gemini import GeminiChatClient
 from dotenv import load_dotenv
+from google.genai.errors import ClientError
 
-from src.research_team import ResearchTeam, build_research_team
+from src.research_team import (
+    ModelUnavailableError,
+    ResearchTeam,
+    build_research_team,
+    format_model_unavailable_message,
+    is_model_unavailable_error,
+)
 
 
 def create_gemini_client() -> GeminiChatClient:
     """Erzeugt einen GeminiChatClient aus Umgebungsvariablen."""
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    model = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.5-flash"
+    model = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-3.6-flash"
     if not api_key:
         raise RuntimeError(
             "Kein Gemini-API-Key gefunden. Setze GEMINI_API_KEY oder GOOGLE_API_KEY "
@@ -27,38 +34,64 @@ def create_gemini_client() -> GeminiChatClient:
     return GeminiChatClient(api_key=api_key, model=model)
 
 
-async def stream_workflow(workflow: Any, prompt: str) -> None:
-    """Streamt Magentic-Events live auf die Konsole."""
+def _configured_model_name() -> str:
+    return os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-3.6-flash"
+
+
+def _print_model_unavailable(exc: BaseException) -> None:
+    if isinstance(exc, ModelUnavailableError):
+        print(f"\nFehler: {exc}", file=sys.stderr)
+        return
+    message = format_model_unavailable_message(_configured_model_name(), exc=exc)
+    print(f"\nFehler: {message}", file=sys.stderr)
+
+
+async def stream_workflow(workflow: Any, prompt: str) -> bool:
+    """Streamt Magentic-Events live auf die Konsole.
+
+    Returns:
+        True bei erfolgreichem Durchlauf, False bei abgefangenem Modellfehler.
+    """
     last_message_id: str | None = None
     last_label: str | None = None
 
-    async for event in workflow.run(prompt, stream=True):
-        if event.type not in ("intermediate", "output"):
-            continue
-        if not isinstance(event.data, AgentResponseUpdate):
-            continue
+    try:
+        async for event in workflow.run(prompt, stream=True):
+            if event.type not in ("intermediate", "output"):
+                continue
+            if not isinstance(event.data, AgentResponseUpdate):
+                continue
 
-        update: AgentResponseUpdate = event.data
-        message_id = update.message_id
-        label = event.executor_id or (
-            "Manager" if event.type == "output" else "Agent"
-        )
+            update: AgentResponseUpdate = event.data
+            message_id = update.message_id
+            label = event.executor_id or (
+                "Manager" if event.type == "output" else "Agent"
+            )
 
-        if message_id != last_message_id:
-            if last_message_id is not None:
-                print()
-            print(f"\n[{label}]: ", end="", flush=True)
-            last_message_id = message_id
-            last_label = label
-        elif label != last_label:
-            print(f"\n[{label}]: ", end="", flush=True)
-            last_label = label
+            if message_id != last_message_id:
+                if last_message_id is not None:
+                    print()
+                print(f"\n[{label}]: ", end="", flush=True)
+                last_message_id = message_id
+                last_label = label
+            elif label != last_label:
+                print(f"\n[{label}]: ", end="", flush=True)
+                last_label = label
 
-        text = update.text or ""
-        if text:
-            print(text, end="", flush=True)
+            text = update.text or ""
+            if text:
+                print(text, end="", flush=True)
 
-    print("\n")
+        print("\n")
+        return True
+    except ModelUnavailableError as exc:
+        _print_model_unavailable(exc)
+        return False
+    except ClientError as exc:
+        if is_model_unavailable_error(exc):
+            _print_model_unavailable(exc)
+            return False
+        raise
 
 
 async def read_input(prompt: str) -> str:
@@ -82,7 +115,12 @@ async def run_cli() -> None:
     team: ResearchTeam = build_research_team(client)
 
     print("\n--- Phase 1: Autonome Diskussion ---\n")
-    await stream_workflow(team.workflow, topic)
+    ok = await stream_workflow(team.workflow, topic)
+    if not ok:
+        print(
+            "Diskussion abgebrochen. Bitte Modell in der .env korrigieren und erneut starten."
+        )
+        return
 
     print("--- Phase 2: Interaktiver Loop ---")
     print("Gib weitere Anweisungen ein (z.B. 'Skeptiker, gehe tiefer auf Punkt B ein').")
@@ -97,7 +135,9 @@ async def run_cli() -> None:
             break
 
         print("\n--- Weitere Magentic-Runde ---\n")
-        await stream_workflow(team.workflow, user_input)
+        ok = await stream_workflow(team.workflow, user_input)
+        if not ok:
+            print("Runde abgebrochen. Du kannst es mit einem anderen Prompt erneut versuchen.")
 
 
 def main() -> None:
@@ -106,6 +146,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nAbgebrochen.")
         sys.exit(130)
+    except ModelUnavailableError as exc:
+        _print_model_unavailable(exc)
+        sys.exit(1)
     except RuntimeError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)
         sys.exit(1)

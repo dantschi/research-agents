@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -33,6 +34,8 @@ CONTENT_FILTER_FALLBACK = (
     "Bitte formuliere die Anfrage wissenschaftlich neutraler."
 )
 
+SUGGESTED_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview")
+
 VISIONARY_INSTRUCTIONS = """\
 Du bist der Visionaer in einem wissenschaftlichen Forschungs-Debattier-Team.
 Deine Aufgabe: Formuliere gewagte, originelle Thesen und Hypothesen zum Forschungsthema.
@@ -53,6 +56,45 @@ Du koordinierst die Diskussion autonom: plane Runden, weise Sprecher zu,
 halte den Fokus auf dem Forschungsziel und beende die Debatte, sobald eine
 ausgewogene wissenschaftliche Bilanz vorliegt. Antworte auf Deutsch.
 """
+
+
+class ModelUnavailableError(RuntimeError):
+    """Das konfigurierte Gemini-Modell ist fuer diesen API-Key nicht nutzbar."""
+
+
+def extract_model_name_from_error(exc: BaseException) -> str | None:
+    """Extrahiert den Modellnamen aus einer Gemini-Fehlermeldung, falls vorhanden."""
+    match = re.search(r"models/([\w.-]+)", str(exc))
+    return match.group(1) if match else None
+
+
+def is_model_unavailable_error(exc: BaseException) -> bool:
+    """Erkennt 404/Deprecation-Fehler fuer nicht verfuegbare Gemini-Modelle."""
+    message = str(exc).lower()
+    if "no longer available" in message:
+        return True
+    if isinstance(exc, ClientError) and exc.code == 404:
+        return any(
+            marker in message
+            for marker in ("model", "not_found", "not found", "not available")
+        )
+    return False
+
+
+def format_model_unavailable_message(
+    model: str | None = None,
+    *,
+    exc: BaseException | None = None,
+) -> str:
+    """Erzeugt eine nutzerfreundliche Fehlermeldung inkl. .env-Hinweis."""
+    resolved = model or (extract_model_name_from_error(exc) if exc else None) or "unbekannt"
+    suggestions = ", ".join(SUGGESTED_MODELS)
+    return (
+        f"Das konfigurierte Gemini-Modell '{resolved}' ist nicht verfuegbar "
+        f"(fuer diesen API-Key gesperrt, veraltet oder unbekannt).\n"
+        f"Bitte setze in der .env z.B. GEMINI_MODEL={SUGGESTED_MODELS[0]} "
+        f"(Alternativen: {suggestions}) und starte erneut."
+    )
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -77,15 +119,22 @@ async def gemini_resilience_middleware(
     context: AgentContext,
     call_next: Callable[[], Awaitable[None]],
 ) -> None:
-    """Absichert Gemini-Aufrufe mit Retry und Content-Filter-Fallback."""
+    """Absichert Gemini-Aufrufe mit Retry, Content-Filter- und Modell-Fehlerbehandlung."""
     last_error: BaseException | None = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             await call_next()
             return
+        except ModelUnavailableError:
+            raise
         except Exception as exc:  # noqa: BLE001 - Middleware faengt API-Fehler zentral
             last_error = exc
+            if is_model_unavailable_error(exc):
+                message = format_model_unavailable_message(exc=exc)
+                logger.error("Gemini-Modell nicht verfuegbar: %s", message)
+                raise ModelUnavailableError(message) from exc
+
             if _is_content_filter_error(exc):
                 logger.warning(
                     "Content-Filter fuer Agent %s: %s",
