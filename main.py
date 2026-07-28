@@ -22,6 +22,7 @@ from src.research_team import (
     is_model_unavailable_error,
     is_workflow_failure_event,
 )
+from src.thinking_indicator import ThinkingIndicator
 
 
 def create_gemini_client() -> GeminiChatClient:
@@ -66,19 +67,30 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
     """
     last_message_id: str | None = None
     last_label: str | None = None
+    thinking = ThinkingIndicator(label="Nachdenken")
 
     try:
+        await thinking.start()
         async for event in workflow.run(prompt, stream=True):
             if is_workflow_failure_event(event):
+                await thinking.stop()
                 _print_error(format_workflow_failure_message(event))
                 return False
 
             if event.type not in ("intermediate", "output"):
+                await thinking.start()
                 continue
             if not isinstance(event.data, AgentResponseUpdate):
+                await thinking.start()
                 continue
 
             update: AgentResponseUpdate = event.data
+            text = update.text or ""
+            if not text:
+                await thinking.start()
+                continue
+
+            await thinking.stop()
             message_id = update.message_id
             label = event.executor_id or (
                 "Manager" if event.type == "output" else "Agent"
@@ -94,9 +106,7 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
                 print(f"\n[{label}]: ", end="", flush=True)
                 last_label = label
 
-            text = update.text or ""
-            if text:
-                print(text, end="", flush=True)
+            print(text, end="", flush=True)
 
         print("\n")
         return True
@@ -112,6 +122,8 @@ async def stream_workflow(workflow: Any, prompt: str) -> bool:
             f"Details: {exc}"
         )
         return False
+    finally:
+        await thinking.stop()
 
 
 async def read_input(prompt: str) -> str:
